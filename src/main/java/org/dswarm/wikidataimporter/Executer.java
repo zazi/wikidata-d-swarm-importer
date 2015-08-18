@@ -12,7 +12,7 @@ public class Executer {
 
 	private static final Logger LOG = LoggerFactory.getLogger(Executer.class);
 
-	private static void executeImport(final String filePath) throws IOException, WikidataImporterException {
+	private static void executeImport(final String filePath) throws IOException, WikidataImporterException, InterruptedException {
 
 		final WikidataDswarmImporter wikidataDswarmImporter = new WikidataDswarmImporter();
 

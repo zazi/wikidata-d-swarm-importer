@@ -35,16 +35,12 @@ import org.glassfish.jersey.media.multipart.MultiPartFeature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.wikidata.wdtk.datamodel.helpers.DatamodelConverter;
-import org.wikidata.wdtk.datamodel.implementation.ItemDocumentImpl;
 import org.wikidata.wdtk.datamodel.implementation.PropertyDocumentImpl;
 import org.wikidata.wdtk.datamodel.interfaces.DataObjectFactory;
 import org.wikidata.wdtk.datamodel.interfaces.EntityDocument;
 import org.wikidata.wdtk.datamodel.interfaces.ItemDocument;
-import org.wikidata.wdtk.datamodel.interfaces.PropertyDocument;
-import org.wikidata.wdtk.datamodel.json.jackson.JacksonItemDocument;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonObjectFactory;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonPropertyDocument;
-import org.wikidata.wdtk.datamodel.json.jackson.JacksonTermedStatementDocument;
 import rx.Observable;
 import rx.schedulers.Schedulers;
 
@@ -452,11 +448,13 @@ public class WikibaseAPIClient {
 
 		final Entity entityBody = Entity.entity(form, MediaType.MULTIPART_FORM_DATA);
 
-		final Observable<Response> post = rx.post(entityBody).subscribeOn(Schedulers.from(EXECUTOR_SERVICE));
+		final Observable<Response> post = rx.post(entityBody).onBackpressureBuffer().subscribeOn(Schedulers.from(EXECUTOR_SERVICE));
 
 		return post.filter(response -> {
 
 			if (response == null) {
+
+				LOG.error("response was null, discontinue processing");
 
 				return false;
 			}
