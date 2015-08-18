@@ -26,6 +26,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -61,6 +63,8 @@ import org.wikidata.wdtk.datamodel.json.jackson.JacksonItemDocument;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonObjectFactory;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonPropertyDocument;
 import rx.Observable;
+import rx.Observer;
+import rx.schedulers.Schedulers;
 
 import org.dswarm.graph.json.LiteralNode;
 import org.dswarm.graph.json.Node;
@@ -109,8 +113,8 @@ public class WikidataDswarmImporter {
 	private final AtomicLong    processedStatementCount = new AtomicLong();
 	private final AtomicInteger propertyIdCounter       = new AtomicInteger(100000);
 
-	private static final Map<String, ItemIdValue>     gdmResourceURIWikidataItemMap     = new HashMap<>();
-	private static final Map<String, PropertyIdValue> gdmPropertyURIWikidataPropertyMap = new HashMap<>();
+	private static final Map<String, ItemIdValue>     gdmResourceURIWikidataItemMap     = new ConcurrentHashMap<>();
+	private static final Map<String, PropertyIdValue> gdmPropertyURIWikidataPropertyMap = new ConcurrentHashMap<>();
 
 	private static final DataObjectFactory  jsonOjbectFactory  = new JacksonObjectFactory();
 	private static final DatamodelConverter datamodelConverter = new DatamodelConverter(jsonOjbectFactory);
@@ -124,31 +128,65 @@ public class WikidataDswarmImporter {
 		wikibaseAPIClient = new WikibaseAPIClient();
 	}
 
-	public void importGDMModel(final String filePath) throws IOException {
+	public void importGDMModel(final String filePath) throws IOException, InterruptedException {
 
 		final Observable<Resource> gdmModel = getGDMModel(filePath);
 
-		gdmModel.map(resource -> {
+		final CountDownLatch countDownLatch = new CountDownLatch(1);
 
-			try {
+		gdmModel.onBackpressureBuffer().observeOn(Schedulers.io()).subscribe(new Observer<Resource>() {
 
-				processGDMResource(resource);
-			} catch (final Exception e) {
+			@Override public void onCompleted() {
 
-				final String message = "something went wrong while processing this resource";
-
-				LOG.error(message, e);
-
-				throw WikidataImporterError.wrap(new WikidataImporterException(message, e));
+				//countDownLatch.countDown();
 			}
 
-			return resource;
-		}).toBlocking().lastOrDefault(null);
+			@Override public void onError(final Throwable e) {
 
+				LOG.error("something went wrong while processing this resource", e);
+
+				countDownLatch.countDown();
+			}
+
+			@Override public void onNext(final Resource resource) {
+
+				try {
+
+					processGDMResource(resource).onBackpressureBuffer().observeOn(Schedulers.immediate()).subscribe(new Observer<ItemIdValue>() {
+
+						@Override public void onCompleted() {
+
+							countDownLatch.countDown();
+						}
+
+						@Override public void onError(Throwable e) {
+
+							LOG.error("something went wrong while processing this resource", e);
+
+							countDownLatch.countDown();
+						}
+
+						@Override public void onNext(ItemIdValue itemIdValue) {
+
+							// nothing TODO here ? - count again?
+						}
+					});
+				} catch (final Exception e) {
+
+					final String message = "something went wrong while processing this resource";
+
+					LOG.error(message, e);
+
+					throw WikidataImporterError.wrap(new WikidataImporterException(message, e));
+				}
+			}
+		});
+
+		countDownLatch.await();
 		// TODO: return Observable (?)
 	}
 
-	private void processGDMResource(final Resource resource) throws JsonProcessingException, WikidataImporterException {
+	private Observable<ItemIdValue> processGDMResource(final Resource resource) throws JsonProcessingException, WikidataImporterException {
 
 		resourceCount.incrementAndGet();
 
@@ -226,10 +264,10 @@ public class WikidataDswarmImporter {
 		final ItemDocument wikidataItem = Datamodel.makeItemDocument(null, labels, descriptions, aliases, statementGroups, siteLinkMap);
 
 		// create item at wikibase (check whether statements are created as well - otherwise we need to create them separately)
-		final ItemIdValue itemIdValue = createWikidataItem(resourceURI, wikidataItem);
+		return createWikidataItem(resourceURI, wikidataItem).map(observableItemIdValue -> {
 
-		// add/update item id value at the resources items map
-		gdmResourceURIWikidataItemMap.putIfAbsent(resourceURI, itemIdValue);
+			// add/update item id value at the resources items map
+			gdmResourceURIWikidataItemMap.putIfAbsent(resourceURI, observableItemIdValue);
 
 		final boolean updated = checkAndOptionallyUpdateBigCounter(resourceCount, bigResourceCount);
 
@@ -237,9 +275,12 @@ public class WikidataDswarmImporter {
 
 			final long currentResourceCount = resourceCount.get();
 
-			LOG.info("processed '{}' resources ('{}' from '{}' statements)", currentResourceCount, processedStatementCount.get(),
-					statementCount.get());
-		}
+				LOG.info("processed '{}' resources ('{}' from '{}' statements)", currentResourceCount, processedStatementCount.get(),
+						statementCount.get());
+			}
+
+			return observableItemIdValue;
+		});
 	}
 
 	/**
@@ -333,7 +374,7 @@ public class WikidataDswarmImporter {
 
 				// handle duplicates, i.e., one can only create uniquely labelled properties in wikibase, otherwise "wikibase-validator-label-conflict" will be thrown
 				final JsonNode entityOrErrorJSON = processEditEntityResponse(propertyIdentifier1, createEntityResponse,
-						WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_PROPERTY);
+						WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_PROPERTY).toBlocking().firstOrDefault(null);
 
 				final JsonNode errorNode = entityOrErrorJSON.get(MEDIAWIKI_ERROR_IDENTIFIER);
 
@@ -620,7 +661,7 @@ public class WikidataDswarmImporter {
 				// note: list of statement groups cannot be null
 				final ItemDocument wikidataItem = Datamodel.makeItemDocument(null, labels, descriptions, aliases, statementGroups, siteLinkMap);
 
-				return createWikidataItem(resourceURI1, wikidataItem);
+				return createWikidataItem(resourceURI1, wikidataItem).toBlocking().firstOrDefault(null);
 			} catch (final WikidataImporterException e) {
 
 				throw WikidataImporterError.wrap(e);
@@ -628,7 +669,7 @@ public class WikidataDswarmImporter {
 		});
 	}
 
-	private ItemIdValue createWikidataItem(final String resourceURI, final ItemDocument wikidataItem) throws WikidataImporterException {
+	private Observable<ItemIdValue> createWikidataItem(final String resourceURI, final ItemDocument wikidataItem) throws WikidataImporterException {
 
 		// create Item at Wikibase (to have a generated Item identifier)
 		try {
@@ -636,143 +677,155 @@ public class WikidataDswarmImporter {
 			final Observable<Response> createEntityResponse = wikibaseAPIClient
 					.createEntity(wikidataItem, WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_ITEM);
 
-			final JsonNode entityOrErrorJSON = processEditEntityResponse(resourceURI, createEntityResponse,
-					WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_ITEM);
+			return processEditEntityResponse(resourceURI, createEntityResponse,
+					WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_ITEM).map(entityOrErrorJSON -> {
 
-			final JsonNode errorNode = entityOrErrorJSON.get(MEDIAWIKI_ERROR_IDENTIFIER);
+				try {
 
-			if (errorNode == null) {
+					final JsonNode errorNode = entityOrErrorJSON.get(MEDIAWIKI_ERROR_IDENTIFIER);
 
-				// response JSON should be an entity
+					if (errorNode == null) {
 
-				final ItemDocument itemDocument = MAPPER.treeToValue(entityOrErrorJSON, JacksonItemDocument.class);
+						// response JSON should be an entity
 
-				if (itemDocument == null) {
+						final ItemDocument itemDocument = MAPPER.treeToValue(entityOrErrorJSON, JacksonItemDocument.class);
 
-					final String message = String
-							.format("could not create new item for '%s'; could not deserialize response body", resourceURI);
+						if (itemDocument == null) {
 
-					LOG.error(message);
+							final String message = String
+									.format("could not create new item for '%s'; could not deserialize response body", resourceURI);
 
-					throw new WikidataImporterException(message);
+							LOG.error(message);
+
+							throw WikidataImporterError.wrap(new WikidataImporterException(message));
+						}
+
+						final ItemIdValue responseItemId = itemDocument.getItemId();
+
+						if (responseItemId == null) {
+
+							final String message = String
+									.format("could not create new item for '%s'; response property id is not available", resourceURI);
+
+							LOG.error(message);
+
+							throw WikidataImporterError.wrap(new WikidataImporterException(message));
+						}
+
+						return responseItemId;
+					}
+
+					// TODO: refactoring following code and that one of property creation duplicate handling into separate method
+
+					// an error occurred
+
+					final JsonNode errorCodeJSON = errorNode.get(MEDIAWIKI_CODE_IDENTIFIER);
+
+					if (errorCodeJSON == null) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an unknown error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final String errorCode = errorCodeJSON.asText();
+
+					if (!MEDIAWIKI_MODIFICATION_FAILED_ERROR_CODE.equals(errorCode)) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final JsonNode messagesJSON = errorNode.get(MEDIAWIKI_MESSAGES_IDENTIFIER);
+
+					if (messagesJSON == null || messagesJSON.size() <= 0) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final JsonNode firstMessageNode = messagesJSON.get(0);
+
+					if (firstMessageNode == null) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final JsonNode errorMessageNameNode = firstMessageNode.get(MEDIAWKI_NAME_IDENTIFIER);
+
+					final String errorMessageName = errorMessageNameNode.asText();
+
+					if (!WIKIBASE_VALIDATOR_LABEL_WITH_DESCRIPTION_CONFLICT_ERROR_MESSAGE_NAME.equals(errorMessageName)) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final JsonNode errorMessageParametersNode = firstMessageNode.get(MEDIAWIKI_PARAMETERS_IDENTIFIER);
+
+					if (errorMessageParametersNode == null || errorMessageParametersNode.size() < 3) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final JsonNode thirdErrorMessageParameterNode = errorMessageParametersNode.get(2);
+
+					if (thirdErrorMessageParameterNode == null) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					// extract the item id from this value
+					final String thirdErrorMessageParameter = thirdErrorMessageParameterNode.asText();
+
+					final Optional<String> optionalItemId = findItemId(thirdErrorMessageParameter);
+
+					if (!optionalItemId.isPresent()) {
+
+						final String message = String
+								.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
+										MAPPER.writeValueAsString(errorNode));
+
+						throw WikidataImporterError.wrap(new WikidataImporterException(message));
+					}
+
+					final String itemId = optionalItemId.get();
+
+					return Datamodel.makeItemIdValue(itemId, null);
+				} catch (final IOException e) {
+
+					final String message = String.format("could not create new item for '%s'", resourceURI);
+
+					LOG.error(message, e);
+
+					throw WikidataImporterError.wrap(new WikidataImporterException(message, e));
 				}
+			});
 
-				final ItemIdValue responseItemId = itemDocument.getItemId();
-
-				if (responseItemId == null) {
-
-					final String message = String
-							.format("could not create new item for '%s'; response property id is not available", resourceURI);
-
-					LOG.error(message);
-
-					throw new WikidataImporterException(message);
-				}
-
-				return responseItemId;
-			}
-
-			// TODO: refactoring following code and that one of property creation duplicate handling into separate method
-
-			// an error occurred
-
-			final JsonNode errorCodeJSON = errorNode.get(MEDIAWIKI_CODE_IDENTIFIER);
-
-			if (errorCodeJSON == null) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an unknown error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final String errorCode = errorCodeJSON.asText();
-
-			if (!MEDIAWIKI_MODIFICATION_FAILED_ERROR_CODE.equals(errorCode)) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final JsonNode messagesJSON = errorNode.get(MEDIAWIKI_MESSAGES_IDENTIFIER);
-
-			if (messagesJSON == null || messagesJSON.size() <= 0) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final JsonNode firstMessageNode = messagesJSON.get(0);
-
-			if (firstMessageNode == null) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final JsonNode errorMessageNameNode = firstMessageNode.get(MEDIAWKI_NAME_IDENTIFIER);
-
-			final String errorMessageName = errorMessageNameNode.asText();
-
-			if (!WIKIBASE_VALIDATOR_LABEL_WITH_DESCRIPTION_CONFLICT_ERROR_MESSAGE_NAME.equals(errorMessageName)) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final JsonNode errorMessageParametersNode = firstMessageNode.get(MEDIAWIKI_PARAMETERS_IDENTIFIER);
-
-			if (errorMessageParametersNode == null || errorMessageParametersNode.size() < 3) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final JsonNode thirdErrorMessageParameterNode = errorMessageParametersNode.get(2);
-
-			if (thirdErrorMessageParameterNode == null) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			// extract the item id from this value
-			final String thirdErrorMessageParameter = thirdErrorMessageParameterNode.asText();
-
-			final Optional<String> optionalItemId = findItemId(thirdErrorMessageParameter);
-
-			if (!optionalItemId.isPresent()) {
-
-				final String message = String
-						.format("could not create new item for '%s'; an error ('%s') occurred", resourceURI,
-								MAPPER.writeValueAsString(errorNode));
-
-				throw new WikidataImporterException(message);
-			}
-
-			final String itemId = optionalItemId.get();
-
-			return Datamodel.makeItemIdValue(itemId, null);
-		} catch (final WikidataImporterException e) {
+		} catch (final RuntimeException | WikidataImporterException e) {
 
 			throw e;
 		} catch (final Exception e) {
@@ -785,100 +838,111 @@ public class WikidataDswarmImporter {
 		}
 	}
 
-	private JsonNode processEditEntityResponse(final String entityIdentifier, final Observable<Response> createEntityResponse, final String type)
-			throws IOException {
+	private Observable<JsonNode> processEditEntityResponse(final String entityIdentifier, final Observable<Response> createEntityResponse,
+			final String type) {
 
-		final Response response = createEntityResponse.toBlocking().firstOrDefault(null);
+		return createEntityResponse.map(response -> {
 
-		if (response == null) {
+			try {
 
-			final String message = String.format("could not create new %s for '%s'", type, entityIdentifier);
+				if (response == null) {
 
-			LOG.error(message);
+					final String message = String.format("could not create new %s for '%s'", type, entityIdentifier);
 
-			throw new WikidataImporterError(new WikidataImporterException(message));
-		}
+					LOG.error(message);
 
-		final int status = response.getStatus();
+					throw WikidataImporterError.wrap(new WikidataImporterException(message));
+				}
 
-		LOG.debug("response status = {}", status);
+				final int status = response.getStatus();
 
-		if (status != 200) {
+				LOG.debug("response status = {}", status);
 
-			final String message = String
-					.format("could not create new %s for '%s'; response status != 200 (was '%d').", type, entityIdentifier, status);
+				if (status != 200) {
 
-			LOG.error(message);
+					final String message = String
+							.format("could not create new %s for '%s'; response status != 200 (was '%d').", type, entityIdentifier, status);
 
-			throw new WikidataImporterError(new WikidataImporterException(message));
-		}
+					LOG.error(message);
 
-		final String responseBody = response.readEntity(String.class);
+					throw WikidataImporterError.wrap(new WikidataImporterException(message));
+				}
 
-		LOG.debug("response body = {}", responseBody);
+				final String responseBody = response.readEntity(String.class);
 
-		final ObjectNode responseJSON = MAPPER.readValue(responseBody, ObjectNode.class);
+				LOG.debug("response body = {}", responseBody);
 
-		if (responseJSON == null) {
+				final ObjectNode responseJSON = MAPPER.readValue(responseBody, ObjectNode.class);
 
-			final String message = String
-					.format("could not create new %s for '%s'; could not deserialize response.", type, entityIdentifier);
+				if (responseJSON == null) {
 
-			LOG.error(message);
+					final String message = String
+							.format("could not create new %s for '%s'; could not deserialize response.", type, entityIdentifier);
 
-			throw new WikidataImporterError(new WikidataImporterException(message));
-		}
+					LOG.error(message);
 
-		final JsonNode errorNode = responseJSON.get(MEDIAWIKI_ERROR_IDENTIFIER);
+					throw WikidataImporterError.wrap(new WikidataImporterException(message));
+				}
 
-		if (errorNode != null) {
+				final JsonNode errorNode = responseJSON.get(MEDIAWIKI_ERROR_IDENTIFIER);
 
-			final String message = String
-					.format("could not create new %s for '%s'; an error occurred ('%s').", type, entityIdentifier, responseBody);
+				if (errorNode != null) {
 
-			LOG.debug(message);
+					final String message = String
+							.format("could not create new %s for '%s'; an error occurred ('%s').", type, entityIdentifier, responseBody);
 
-			// return error so that it can be handled at the client
-			return responseJSON;
-		}
+					LOG.debug(message);
 
-		final JsonNode successNode = responseJSON.get(MEDIAWIKI_SUCCESS_IDENTIFIER);
+					// return error so that it can be handled at the client
+					return responseJSON;
+				}
 
-		if (successNode == null) {
+				final JsonNode successNode = responseJSON.get(MEDIAWIKI_SUCCESS_IDENTIFIER);
 
-			final String message = String
-					.format("could not create new %s for '%s'; no 'success' node in response ('%s')", type, entityIdentifier, responseBody);
+				if (successNode == null) {
 
-			LOG.error(message);
+					final String message = String
+							.format("could not create new %s for '%s'; no 'success' node in response ('%s')", type, entityIdentifier, responseBody);
 
-			throw new WikidataImporterError(new WikidataImporterException(message));
-		}
+					LOG.error(message);
 
-		final int success = successNode.asInt();
+					throw WikidataImporterError.wrap(new WikidataImporterException(message));
+				}
 
-		if (success != 1) {
+				final int success = successNode.asInt();
 
-			final String message = String
-					.format("could not create new %s for '%s'; 'success' = '%d'", type, entityIdentifier, success);
+				if (success != 1) {
 
-			LOG.error(message);
+					final String message = String
+							.format("could not create new %s for '%s'; 'success' = '%d'", type, entityIdentifier, success);
 
-			throw new WikidataImporterError(new WikidataImporterException(message));
-		}
+					LOG.error(message);
 
-		final JsonNode entityNode = responseJSON.get(MEDIAWIKI_ENTITY_IDENTIFIER);
+					throw new WikidataImporterError(new WikidataImporterException(message));
+				}
 
-		if (entityNode == null) {
+				final JsonNode entityNode = responseJSON.get(MEDIAWIKI_ENTITY_IDENTIFIER);
 
-			final String message = String
-					.format("could not create new %s for '%s'; no 'entity' node in response ('%s')", type, entityIdentifier, responseBody);
+				if (entityNode == null) {
 
-			LOG.error(message);
+					final String message = String
+							.format("could not create new %s for '%s'; no 'entity' node in response ('%s')", type, entityIdentifier, responseBody);
 
-			throw new WikidataImporterError(new WikidataImporterException(message));
-		}
+					LOG.error(message);
 
-		return entityNode;
+					throw WikidataImporterError.wrap(new WikidataImporterException(message));
+				}
+
+				return entityNode;
+			} catch (final IOException e) {
+
+				final String message = String.format("could not create new %s for '%s'", type, entityIdentifier);
+
+				LOG.error(message, e);
+
+				throw WikidataImporterError.wrap(new WikidataImporterException(message, e));
+			}
+		});
 	}
 
 	private static Observable<Resource> getGDMModel(final String filePath) throws IOException {
