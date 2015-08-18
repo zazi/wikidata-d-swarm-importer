@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import javax.ws.rs.client.Client;
 import javax.ws.rs.client.ClientBuilder;
@@ -39,6 +40,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.io.Resources;
+import com.netflix.hystrix.HystrixCommandGroupKey;
+import com.netflix.hystrix.HystrixCommandProperties;
+import com.netflix.hystrix.HystrixObservableCommand;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.glassfish.jersey.client.ClientProperties;
 import org.glassfish.jersey.client.rx.RxInvocationBuilder;
@@ -57,7 +61,10 @@ import org.wikidata.wdtk.datamodel.interfaces.ItemDocument;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonObjectFactory;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonPropertyDocument;
 import rx.Observable;
+import rx.functions.Func2;
 import rx.schedulers.Schedulers;
+
+import org.dswarm.wikidataimporter.types.Tuple;
 
 /**
  * @author tgaengler
@@ -71,6 +78,7 @@ public class WikibaseAPIClient {
 	private static final String MEDIAWIKI_API_ENDPOINT          = "mediawiki_api_endpoint";
 	private static final String FALLBACK_MEDIAWIKI_API_ENDPOINT = "http://localhost:1234/whoknows";
 	private static final String DSWARM_USER_AGENT_IDENTIFIER    = "DMP 2000";
+	public static final  String WIKIBASE_API_DSWARM_CLIENT      = "wikibase-api-dswarm-client";
 	private static final String MEDIAWIKI_USERNAME              = "mediawiki_username";
 	private static final String MEDIAWIKI_PASSWORD              = "mediawiki_password";
 
@@ -395,45 +403,47 @@ public class WikibaseAPIClient {
 	public Observable<Response> createEntity(final EntityDocument entity, final String entityType)
 			throws JsonProcessingException, WikidataImporterException {
 
-		final EntityDocument jacksonEntity;
+		//		final EntityDocument jacksonEntity;
+		//
+		//		switch (entityType) {
+		//
+		//			case WIKIBASE_API_ENTITY_TYPE_ITEM:
+		//
+		//				//jacksonEntity = JacksonItemDocument.fromItemDocumentImpl((ItemDocumentImpl) entity);
+		//				jacksonEntity = datamodelConverter.copy((ItemDocument) entity);
+		//
+		//				break;
+		//			case WIKIBASE_API_ENTITY_TYPE_PROPERTY:
+		//
+		//				jacksonEntity = JacksonPropertyDocument.fromPropertyDocumentImpl((PropertyDocumentImpl) entity);
+		//
+		//				break;
+		//			default:
+		//
+		//				final String message = String.format("unknown entity type '%s'", entityType);
+		//
+		//				LOG.error(message);
+		//
+		//				throw new WikidataImporterException(message);
+		//		}
+		//
+		//		final String entityJSONString = MAPPER.writeValueAsString(jacksonEntity);
+		//
+		//		LOG.debug("create new '{}' with '{}'", entityType, entityJSONString);
+		//
+		//		final RxObservableInvoker rx = buildBaseRequestWithCookies(cookies);
+		//
+		//		final FormDataMultiPart form = new FormDataMultiPart()
+		//				.field(MEDIAWIKI_API_ACTION_IDENTIFIER, WIKIBASE_API_EDIT_ENTITY)
+		//				.field(WIKIBASE_API_NEW_IDENTIFIER, entityType)
+		//				.field(WIKIBASE_API_DATA_IDENTIFIER, entityJSONString)
+		//				.field(MEDIAWIKI_API_TOKEN_IDENTIFIER, editToken)
+		//				.field(MEDIAWIKI_API_FORMAT_IDENTIFIER, MEDIAWIKI_API_JSON_FORMAT);
+		//		//form.bodyPart(entityJSONString, MediaType.APPLICATION_JSON_TYPE);
+		//
+		//		return excutePOST(rx, form);
 
-		switch (entityType) {
-
-			case WIKIBASE_API_ENTITY_TYPE_ITEM:
-
-				//jacksonEntity = JacksonItemDocument.fromItemDocumentImpl((ItemDocumentImpl) entity);
-				jacksonEntity = datamodelConverter.copy((ItemDocument) entity);
-
-				break;
-			case WIKIBASE_API_ENTITY_TYPE_PROPERTY:
-
-				jacksonEntity = JacksonPropertyDocument.fromPropertyDocumentImpl((PropertyDocumentImpl) entity);
-
-				break;
-			default:
-
-				final String message = String.format("unknown entity type '%s'", entityType);
-
-				LOG.error(message);
-
-				throw new WikidataImporterException(message);
-		}
-
-		final String entityJSONString = MAPPER.writeValueAsString(jacksonEntity);
-
-		LOG.debug("create new '{}' with '{}'", entityType, entityJSONString);
-
-		final RxObservableInvoker rx = buildBaseRequestWithCookies(cookies);
-
-		final FormDataMultiPart form = new FormDataMultiPart()
-				.field(MEDIAWIKI_API_ACTION_IDENTIFIER, WIKIBASE_API_EDIT_ENTITY)
-				.field(WIKIBASE_API_NEW_IDENTIFIER, entityType)
-				.field(WIKIBASE_API_DATA_IDENTIFIER, entityJSONString)
-				.field(MEDIAWIKI_API_TOKEN_IDENTIFIER, editToken)
-				.field(MEDIAWIKI_API_FORMAT_IDENTIFIER, MEDIAWIKI_API_JSON_FORMAT);
-		//form.bodyPart(entityJSONString, MediaType.APPLICATION_JSON_TYPE);
-
-		return excutePOST(rx, form);
+		return new CreateEntityCommand(entity, entityType).toObservable();
 	}
 
 	public static Map<String, NewCookie> getCookies(final Response response) {
@@ -516,4 +526,150 @@ public class WikibaseAPIClient {
 
 		return propertyValue;
 	}
+
+	//
+	// class CreateEntityCommand
+	//
+	private class CreateEntityCommand extends CommonCommand<Response> {
+
+		private static final int  RESUME_LIMIT        = 10;
+		private static final long RETRY_REQUEST_DELAY = 1000;
+
+		private final EntityDocument entity;
+		private final String         entityType;
+
+		public CreateEntityCommand(final EntityDocument entityArg, final String entityTypeArg) {
+
+			super("destination=" + WIKIBASE_API_EDIT_ENTITY, REQUEST_TIMEOUT);
+
+			entity = entityArg;
+			entityType = entityTypeArg;
+		}
+
+		@Override
+		protected Observable<Response> construct() {
+
+			try {
+
+				final EntityDocument jacksonEntity;
+
+				switch (entityType) {
+
+					case WIKIBASE_API_ENTITY_TYPE_ITEM:
+
+						//jacksonEntity = JacksonItemDocument.fromItemDocumentImpl((ItemDocumentImpl) entity);
+						jacksonEntity = datamodelConverter.copy((ItemDocument) entity);
+
+						break;
+					case WIKIBASE_API_ENTITY_TYPE_PROPERTY:
+
+						jacksonEntity = JacksonPropertyDocument.fromPropertyDocumentImpl((PropertyDocumentImpl) entity);
+
+						break;
+					default:
+
+						final String message = String.format("unknown entity type '%s'", entityType);
+
+						LOG.error(message);
+
+						throw new WikidataImporterException(message);
+				}
+
+				final String entityJSONString = MAPPER.writeValueAsString(jacksonEntity);
+
+				LOG.debug("create new '{}' with '{}'", entityType, entityJSONString);
+
+				final RxObservableInvoker rx = buildBaseRequestWithCookies(cookies);
+
+				final FormDataMultiPart form = new FormDataMultiPart()
+						.field(MEDIAWIKI_API_ACTION_IDENTIFIER, WIKIBASE_API_EDIT_ENTITY)
+						.field(WIKIBASE_API_NEW_IDENTIFIER, entityType)
+						.field(WIKIBASE_API_DATA_IDENTIFIER, entityJSONString)
+						.field(MEDIAWIKI_API_TOKEN_IDENTIFIER, editToken)
+						.field(MEDIAWIKI_API_FORMAT_IDENTIFIER, MEDIAWIKI_API_JSON_FORMAT);
+				//form.bodyPart(entityJSONString, MediaType.APPLICATION_JSON_TYPE);
+
+				return excutePOST(rx, form);
+			} catch (final WikidataImporterException e) {
+
+				throw WikidataImporterError.wrap(e);
+			} catch (final Exception e) {
+
+				final String message = String.format("could not create entity of entity type '%s'", entityType);
+
+				LOG.error(message, e);
+
+				throw WikidataImporterError.wrap(new WikidataImporterException(message, e));
+			}
+		}
+
+		@Override
+		protected Observable<Response> resumeWithFallback() {
+
+			handleErrors();
+
+			// inspired by http://stackoverflow.com/a/27094967/1022591
+			return construct().retryWhen(
+					attempts -> attempts.zipWith(Observable.range(1, RESUME_LIMIT + 1),
+							(Func2<Throwable, Integer, Tuple<Throwable, Integer>>) Tuple::new)
+							.flatMap(
+									ni -> {
+
+										final Integer attempt = ni.v2();
+
+										if (attempt > RESUME_LIMIT) {
+
+											final Throwable exception = ni.v1();
+
+											LOG.error("something happened", exception);
+
+											// shall we return an empty observable here instead, and log that request (attempts) failed for some reason?
+											return Observable.error(exception);
+										}
+
+										// (long) Math.pow(2, ni.v2())
+										return Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS);
+									}));
+		}
+	} //class CreateEntityCommand
+
+	//
+	// class CommonCommand
+	//
+	private abstract class CommonCommand<R> extends HystrixObservableCommand<R> {
+
+		private final String debugMessage;
+
+		public CommonCommand(final String debugMessage, final int timeout) {
+
+			super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey(WIKIBASE_API_DSWARM_CLIENT))
+					.andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
+							.withExecutionTimeoutInMilliseconds(timeout)));
+
+			this.debugMessage = debugMessage;
+		}
+
+		protected void handleErrors() {
+
+			final String message;
+
+			if (isFailedExecution()) {
+
+				message = getMessagePrefix() + "FAILED: " + getFailedExecutionException().getMessage();
+			} else if (isResponseTimedOut()) {
+
+				message = getMessagePrefix() + "TIMED OUT";
+			} else {
+
+				message = getMessagePrefix() + "SOME OTHER FAILURE";
+			}
+
+			LOG.error(message);
+		}
+
+		private String getMessagePrefix() {
+
+			return this.getClass().getSimpleName() + " [" + debugMessage + "]: ";
+		}
+	} //class CommonCommand
 }
