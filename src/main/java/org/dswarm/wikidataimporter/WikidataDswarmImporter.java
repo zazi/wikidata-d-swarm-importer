@@ -13,6 +13,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -69,8 +70,8 @@ public class WikidataDswarmImporter {
 
 	private static final String TOO_LONG_VALUE_POSTFIX = "...";
 
-	private static Pattern PROPERTY_PARAMETER_PATTERN = Pattern.compile("\\[\\[Property:(\\S+)\\|");
-	private static Pattern ITEM_PARAMETER_PATTERN     = Pattern.compile("\\[\\[Item:(\\S+)\\|");
+	private static final Pattern PROPERTY_PARAMETER_PATTERN = Pattern.compile("\\[\\[Property:(\\S+)\\|");
+	private static final Pattern ITEM_PARAMETER_PATTERN     = Pattern.compile("\\[\\[Item:(\\S+)\\|");
 
 	private static final String LANGUAGE_CODE_EN                                                      = "en";
 	private static final String CONFIDENCE_QUALIFIED_ATTRIBUTE_IDENTIFIER                             = "confidence";
@@ -121,9 +122,15 @@ public class WikidataDswarmImporter {
 
 		gdmModel.onBackpressureBuffer().observeOn(Schedulers.io()).subscribe(new Observer<Resource>() {
 
+			final AtomicBoolean seenFirstResource = new AtomicBoolean();
+			final AtomicBoolean seenSecondResource = new AtomicBoolean();
+
 			@Override public void onCompleted() {
 
-				//countDownLatch.countDown();
+				if (!seenFirstResource.get() || !seenSecondResource.get()) {
+
+					countDownLatch.countDown();
+				}
 			}
 
 			@Override public void onError(final Throwable e) {
@@ -136,6 +143,20 @@ public class WikidataDswarmImporter {
 			@Override public void onNext(final Resource resource) {
 
 				try {
+
+					if (seenFirstResource.compareAndSet(false, true)) {
+
+						LOG.info("start processing first resource blocking");
+
+						// process first resource blocking, i.e., before all other resources will be processed
+						processGDMResource(resource).toBlocking().lastOrDefault(null);
+
+						LOG.info("finished processing first resource blocking");
+
+						return;
+					}
+
+					seenSecondResource.getAndSet(true);
 
 					processGDMResource(resource).onBackpressureBuffer().observeOn(Schedulers.immediate()).subscribe(new Observer<ItemIdValue>() {
 
@@ -499,7 +520,7 @@ public class WikidataDswarmImporter {
 				final String propertyId = optionalPropertyId.get();
 
 				return Datamodel.makePropertyIdValue(propertyId, null);
-			} catch(RuntimeException e) {
+			} catch (RuntimeException e) {
 
 				throw e;
 			} catch (final WikidataImporterException e1) {
