@@ -374,7 +374,12 @@ public class WikidataDswarmImporter {
 
 				// handle duplicates, i.e., one can only create uniquely labelled properties in wikibase, otherwise "wikibase-validator-label-conflict" will be thrown
 				final JsonNode entityOrErrorJSON = processEditEntityResponse(propertyIdentifier1, createEntityResponse,
-						WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_PROPERTY).toBlocking().firstOrDefault(null);
+						WikibaseAPIClient.WIKIBASE_API_ENTITY_TYPE_PROPERTY).toBlocking().lastOrDefault(null);
+
+				// TODO: null check, i.e., the property can't be null here - what can we do to avoid this?
+				//    - queue the requests at the beginning?
+				//    - make a higher priority for processing property requests?
+				//    - process the first resource in advance, i.e., a kind of warm-up step?
 
 				final JsonNode errorNode = entityOrErrorJSON.get(MEDIAWIKI_ERROR_IDENTIFIER);
 
@@ -509,6 +514,9 @@ public class WikidataDswarmImporter {
 				final String propertyId = optionalPropertyId.get();
 
 				return Datamodel.makePropertyIdValue(propertyId, null);
+			} catch(RuntimeException e) {
+
+				throw e;
 			} catch (final WikidataImporterException e1) {
 
 				throw WikidataImporterError.wrap(e1);
@@ -661,7 +669,7 @@ public class WikidataDswarmImporter {
 				// note: list of statement groups cannot be null
 				final ItemDocument wikidataItem = Datamodel.makeItemDocument(null, labels, descriptions, aliases, statementGroups, siteLinkMap);
 
-				return createWikidataItem(resourceURI1, wikidataItem).toBlocking().firstOrDefault(null);
+				return createWikidataItem(resourceURI1, wikidataItem).toBlocking().lastOrDefault(null);
 			} catch (final WikidataImporterException e) {
 
 				throw WikidataImporterError.wrap(e);

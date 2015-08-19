@@ -23,6 +23,7 @@ import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.ws.rs.client.Client;
 import javax.ws.rs.client.ClientBuilder;
@@ -57,14 +58,12 @@ import org.wikidata.wdtk.datamodel.helpers.DatamodelConverter;
 import org.wikidata.wdtk.datamodel.implementation.PropertyDocumentImpl;
 import org.wikidata.wdtk.datamodel.interfaces.DataObjectFactory;
 import org.wikidata.wdtk.datamodel.interfaces.EntityDocument;
+import org.wikidata.wdtk.datamodel.interfaces.EntityIdValue;
 import org.wikidata.wdtk.datamodel.interfaces.ItemDocument;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonObjectFactory;
 import org.wikidata.wdtk.datamodel.json.jackson.JacksonPropertyDocument;
 import rx.Observable;
-import rx.functions.Func2;
 import rx.schedulers.Schedulers;
-
-import org.dswarm.wikidataimporter.types.Tuple;
 
 /**
  * @author tgaengler
@@ -538,12 +537,25 @@ public class WikibaseAPIClient {
 		private final EntityDocument entity;
 		private final String         entityType;
 
+		private final AtomicInteger retryCount;
+
 		public CreateEntityCommand(final EntityDocument entityArg, final String entityTypeArg) {
+
+			// REQUEST_TIMEOUT
+			super("destination=" + WIKIBASE_API_EDIT_ENTITY, 110000);
+
+			entity = entityArg;
+			entityType = entityTypeArg;
+			retryCount = new AtomicInteger();
+		}
+
+		public CreateEntityCommand(final EntityDocument entityArg, final String entityTypeArg, final AtomicInteger retryCountArg) {
 
 			super("destination=" + WIKIBASE_API_EDIT_ENTITY, REQUEST_TIMEOUT);
 
 			entity = entityArg;
 			entityType = entityTypeArg;
+			retryCount = retryCountArg;
 		}
 
 		@Override
@@ -589,7 +601,30 @@ public class WikibaseAPIClient {
 						.field(MEDIAWIKI_API_FORMAT_IDENTIFIER, MEDIAWIKI_API_JSON_FORMAT);
 				//form.bodyPart(entityJSONString, MediaType.APPLICATION_JSON_TYPE);
 
-				return excutePOST(rx, form);
+				// simulate retry behaviour here
+				return excutePOST(rx, form).observeOn(Schedulers.io()).onExceptionResumeNext(
+						Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS).take(1)
+								.filter(aLong -> {
+
+									final String entityId = determineEntityId();
+
+									if (retryCount.get() <= RESUME_LIMIT) {
+
+										LOG.debug("retry create-entity request for '{}' of entity type '{}' for the '{}' time",
+												entityId, entityType,
+												retryCount.get());
+
+										retryCount.incrementAndGet();
+
+										return true;
+									}
+
+									LOG.debug("reached limit for create-entity request of '{}' of entity type '{}'", entityId,
+											entityType);
+
+									return false;
+								}).flatMap(aLong -> new CreateEntityCommand(entity, entityType, retryCount)
+								.toObservable()));
 			} catch (final WikidataImporterException e) {
 
 				throw WikidataImporterError.wrap(e);
@@ -609,27 +644,81 @@ public class WikibaseAPIClient {
 			handleErrors();
 
 			// inspired by http://stackoverflow.com/a/27094967/1022591
-			return construct().retryWhen(
-					attempts -> attempts.zipWith(Observable.range(1, RESUME_LIMIT + 1),
-							(Func2<Throwable, Integer, Tuple<Throwable, Integer>>) Tuple::new)
-							.flatMap(
-									ni -> {
+			// note: we always need to fire a new hystrix command, because this requires new network traffic, see
+			//   This should do work that does not require network transport to produce.
+			//   In other words, this should be a static or cached result that can immediately be returned upon failure.
+			//   If network traffic is wanted for fallback (such as going to MemCache) then the fallback implementation should invoke another HystrixObservableCommand instance that protects against that network access and possibly has another level of fallback that does not involve network access.
+			// from https://netflix.github.io/Hystrix/javadoc/com/netflix/hystrix/HystrixObservableCommand.html#construct%28%29
 
-										final Integer attempt = ni.v2();
+			// do retry logic in construct, since it looks like that we cannot do any more network calls from here, see AbstractCommand#getFallbackOrThrowException
+			//   If something in the <code>getFallback()</code> implementation is latent (such as a network call) then the semaphore will cause us to start rejecting requests rather than allowing potentially
+			//   all threads to pile up and block.
+			//
+			//			if (retryCount.get() <= RESUME_LIMIT) {
+			//
+			//				retryCount.incrementAndGet();
+			//
+			//				LOG.debug("retry create-entity request for '{}' of entity type '{}' for the '{}' time", entity.getEntityId().getId(), entityType,
+			//						retryCount.get());
+			//
+			//				// return new hystrix command observable delayed
+			//				//				return new CreateEntityCommand(entity, entityType, retryCount).construct()
+			//				//						.retryWhen(delay -> Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS));
+			//				//				return new CreateEntityCommand(entity, entityType, retryCount).construct().observeOn(Schedulers.io())
+			//				//						.delay(delay -> Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS));
+			//				return Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS)
+			//						.flatMap(aLong -> new CreateEntityCommand(entity, entityType, retryCount).toObservable().subscribeOn(Schedulers.newThread()))
+			//						.take(1);
+			//			}
 
-										if (attempt > RESUME_LIMIT) {
+			final String entityId = determineEntityId();
 
-											final Throwable exception = ni.v1();
+			LOG.debug("reached limit for create-entity request of '{}' of entity type '{}'", entityId, entityType);
 
-											LOG.error("something happened", exception);
+			return Observable.empty();
 
-											// shall we return an empty observable here instead, and log that request (attempts) failed for some reason?
-											return Observable.error(exception);
-										}
+			//			return construct().retryWhen(
+			//					attempts -> attempts.zipWith(Observable.range(1, RESUME_LIMIT + 1),
+			//							(Func2<Throwable, Integer, Tuple<Throwable, Integer>>) Tuple::new)
+			//							.flatMap(
+			//									ni -> {
+			//
+			//										final Integer attempt = ni.v2();
+			//
+			//										if (attempt > RESUME_LIMIT) {
+			//
+			//											final Throwable exception = ni.v1();
+			//
+			//											LOG.error("something happened", exception);
+			//
+			//											// shall we return an empty observable here instead, and log that request (attempts) failed for some reason?
+			//											return Observable.error(exception);
+			//										}
+			//
+			//										// (long) Math.pow(2, ni.v2())
+			//										return Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS);
+			//									}));
+		}
 
-										// (long) Math.pow(2, ni.v2())
-										return Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS);
-									}));
+		private String determineEntityId() {
+
+			if(entity == null) {
+
+				LOG.debug("cannot determine entity id - entity is not available");
+
+				return null;
+			}
+
+			final EntityIdValue entityId = entity.getEntityId();
+
+			if(entityId == null) {
+
+				LOG.debug("cannot determine entity id - entity id object is not available");
+
+				return null;
+			}
+
+			return entityId.getId();
 		}
 	} //class CreateEntityCommand
 
@@ -644,7 +733,14 @@ public class WikibaseAPIClient {
 
 			super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey(WIKIBASE_API_DSWARM_CLIENT))
 					.andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
-							.withExecutionTimeoutInMilliseconds(timeout)));
+									.withExecutionTimeoutInMilliseconds(timeout)
+									.withExecutionIsolationSemaphoreMaxConcurrentRequests(1000)
+									.withFallbackIsolationSemaphoreMaxConcurrentRequests(1000)
+									.withExecutionTimeoutEnabled(true)
+									.withFallbackEnabled(true)
+									.withRequestCacheEnabled(false)
+							        .withCircuitBreakerRequestVolumeThreshold(100)
+					));
 
 			this.debugMessage = debugMessage;
 		}
