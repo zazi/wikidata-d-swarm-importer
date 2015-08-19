@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.ws.rs.client.Client;
 import javax.ws.rs.client.ClientBuilder;
@@ -64,6 +65,7 @@ public class WikibaseAPIClient {
 	private static final String MEDIAWIKI_PASSWORD              = "mediawiki_password";
 
 	private static final String wikibaseAPIBaseURI;
+	private static final int REQUEST_GAP = 50;
 
 	static {
 
@@ -132,6 +134,13 @@ public class WikibaseAPIClient {
 
 	private final String                 editToken;
 	private final Map<String, NewCookie> cookies;
+
+	private final AtomicLong requestCount              = new AtomicLong();
+	private final AtomicLong bigRequestCount           = new AtomicLong();
+	private final AtomicLong successfulRequestCount    = new AtomicLong();
+	private final AtomicLong bigSuccessfulRequestCount = new AtomicLong();
+	private final AtomicLong failedRequestCount        = new AtomicLong();
+	private final AtomicLong bigFailedRequestCount     = new AtomicLong();
 
 	public WikibaseAPIClient() throws WikidataImporterException {
 
@@ -425,6 +434,7 @@ public class WikibaseAPIClient {
 		//		return excutePOST(rx, form);
 
 		//return new CreateEntityCommand(entity, entityType).toObservable();
+
 		return new CreateEntityRequestOperator(entityType).processEntity(entity);
 	}
 
@@ -455,7 +465,8 @@ public class WikibaseAPIClient {
 
 		final Entity entityBody = Entity.entity(form, MediaType.MULTIPART_FORM_DATA);
 
-		final Observable<Response> post = rx.post(entityBody).onBackpressureBuffer().subscribeOn(Schedulers.from(EXECUTOR_SERVICE));
+		final Observable<Response> post = Observable.timer(REQUEST_GAP, TimeUnit.MILLISECONDS).flatMap(
+				aLong -> rx.post(entityBody).onBackpressureBuffer().subscribeOn(Schedulers.from(EXECUTOR_SERVICE)));
 
 		return post.filter(response -> {
 
@@ -758,6 +769,15 @@ public class WikibaseAPIClient {
 
 		public Observable<Response> processEntity(final EntityDocument entity) {
 
+			final long currentRequestCount = requestCount.incrementAndGet();
+
+			if (currentRequestCount / 10000 == bigRequestCount.get()) {
+
+				bigRequestCount.incrementAndGet();
+
+				LOG.info("started '{}' requests", currentRequestCount);
+			}
+
 			try {
 
 				final EntityDocument jacksonEntity;
@@ -799,36 +819,54 @@ public class WikibaseAPIClient {
 
 				// simulate retry behaviour here
 				// ).onExceptionResumeNext(
+				// TODO: we probably need another scheduler here, or? - e.g. a thread pool with a fixed size
 				return excutePOST(rx, form).observeOn(Schedulers.io()).onErrorResumeNext(ex -> {
 
-					LOG.error("in onErrorResumeNext with entity type '{}'", entityType);
+					final long currentFailedRequestCount = failedRequestCount.incrementAndGet();
+
+					if (currentFailedRequestCount / 10000 == bigFailedRequestCount.get()) {
+
+						bigFailedRequestCount.incrementAndGet();
+
+						LOG.info("failed '{}' requests (from '{}' started requests)", currentFailedRequestCount, requestCount.get());
+					}
+
+					//LOG.error("in onErrorResumeNext with entity type '{}'", entityType);
 
 					LOG.trace("in onErrorResumeNext with entity type '{}'", entityType, ex);
 
-					return Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS).take(1)
+					return Observable.timer(RETRY_REQUEST_DELAY, TimeUnit.MILLISECONDS)
 							.filter(aLong -> {
 
 								final String entityId = determineEntityId(entity);
 
-								LOG.debug("retry count '{}' :: resume limit '{}' entity type '{}'", retryCount.get(), resumeLimit,
-										entityType);
+								final int retryCount = this.retryCount.incrementAndGet();
 
-								if (retryCount.get() <= resumeLimit) {
+								LOG.debug("retry count '{}' :: resume limit '{}' entity type '{}'", retryCount, resumeLimit, entityType);
 
-									LOG.debug("retry create-entity request for '{}' of entity type '{}' for the '{}' time",
-											entityId, entityType,
-											retryCount.get());
+								if (retryCount <= resumeLimit) {
 
-									retryCount.incrementAndGet();
+									LOG.debug("retry create-entity request for '{}' of entity type '{}' for the '{}' time", entityId, entityType,
+											retryCount);
 
 									return true;
 								}
 
-								LOG.debug("reached limit for create-entity request of '{}' of entity type '{}'", entityId,
-										entityType);
+								LOG.debug("reached limit for create-entity request of '{}' of entity type '{}'", entityId, entityType);
 
 								return false;
-							}).flatMap(aLong -> processEntity(entity));
+							}).flatMap(aLong -> processEntity(entity)).doOnCompleted(() -> {
+
+								final long currentSuccessfulRequestCount = successfulRequestCount.incrementAndGet();
+
+								if (currentSuccessfulRequestCount / 10000 == bigSuccessfulRequestCount.get()) {
+
+									bigSuccessfulRequestCount.incrementAndGet();
+
+									LOG.info("processed '{}' requests successfully (from '{}' started requests)", currentSuccessfulRequestCount,
+											requestCount.get());
+								}
+							});
 				});
 			} catch (final WikidataImporterException e) {
 

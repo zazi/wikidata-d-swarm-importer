@@ -202,7 +202,7 @@ public class WikidataDswarmImporter {
 		final List<MonolingualTextValue> descriptions = generateLabels(resourceURI);
 		final List<MonolingualTextValue> aliases = new ArrayList<>();
 
-		final Map<String, List<org.wikidata.wdtk.datamodel.interfaces.Statement>> wikidataStatementsMap = new HashMap<>();
+		final Map<String, List<org.wikidata.wdtk.datamodel.interfaces.Statement>> wikidataStatementsMap = new ConcurrentHashMap<>();
 
 		final Set<Statement> gdmStatements = resource.getStatements();
 
